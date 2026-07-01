@@ -119,6 +119,7 @@ private:
 	void AudioTask();
 
 	void UpdateUSB(bool bStartup = false);
+	bool MountUSBFileSystem();
 	void UpdateNetwork();
 	void UpdateMIDI();
 	void PurgeMIDIBuffers();
@@ -153,6 +154,8 @@ private:
 	CUSBHCIDevice* m_pUSBHCI;
 	FATFS m_USBFileSystem;
 	bool m_bUSBAvailable;
+	bool m_bUSBMounted;
+	unsigned m_nUSBMountRetryTime;
 
 	// Networking
 	CNetSubSystem* m_pNet;

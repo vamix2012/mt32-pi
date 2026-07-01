@@ -75,6 +75,8 @@ CMT32Pi::CMT32Pi(CI2CMaster* pI2CMaster, CSPIMaster* pSPIMaster, CInterruptSyste
 	  m_pUSBHCI(pUSBHCI),
 	  m_USBFileSystem{},
 	  m_bUSBAvailable(false),
+	  m_bUSBMounted(false),
+	  m_nUSBMountRetryTime(0),
 
 	  m_pNet(nullptr),
 	  m_pNetDevice(nullptr),
@@ -187,8 +189,31 @@ bool CMT32Pi::Initialize(bool bSerialMIDIAvailable)
 	{
 		m_bUSBAvailable = true;
 
-		// Perform an initial Plug and Play update to initialize devices early
-		UpdateUSB(true);
+		// On the Pi 3B+/Zero 2 W (DWC OTG controller), a USB stick present at
+		// boot enumerates more slowly than on the Pi 4 (VL805). The single
+		// Plug-and-Play update below would otherwise run before the
+		// mass-storage device has appeared, so no USB SoundFonts would be
+		// found by the startup scan. Drive Plug-and-Play for a few seconds so
+		// the device has time to enumerate and mount. The wait duration is
+		// configurable via the "usb_boot_wait" option (0 disables it).
+		if (m_pConfig->SystemUSBBootWait > 0)
+		{
+			LCDLog(TLCDLogType::Spinner, "USB wait");
+
+			const unsigned nStartTicks = m_pTimer->GetTicks();
+			const unsigned nWaitTicks = MSEC2HZ(m_pConfig->SystemUSBBootWait * 1000);
+			while (!m_bUSBMounted && (m_pTimer->GetTicks() - nStartTicks) < nWaitTicks)
+			{
+				UpdateUSB(true);
+				if (!m_bUSBMounted)
+					m_pTimer->SimpleMsDelay(50);
+			}
+		}
+		else
+		{
+			// Perform an initial Plug and Play update to initialize devices early
+			UpdateUSB(true);
+		}
 	}
 #endif
 
@@ -485,6 +510,34 @@ void CMT32Pi::MainTask()
 		// Check for USB PnP events
 		UpdateUSB();
 
+		// Retry mounting a USB device that is present but not yet mounted,
+		// e.g. its media was not ready at attach time. Throttled to once per
+		// second to avoid hammering the USB subsystem.
+		if (m_pUSBMassStorageDevice && !m_bUSBMounted
+		    && (m_pTimer->GetTicks() - m_nUSBMountRetryTime) >= MSEC2HZ(1000))
+		{
+			m_nUSBMountRetryTime = m_pTimer->GetTicks();
+
+			m_bUSBMounted = MountUSBFileSystem();
+			if (m_bUSBMounted)
+			{
+				LCDLog(TLCDLogType::Spinner, "MT-32 ROM rescan");
+				if (m_pMT32Synth)
+					m_pMT32Synth->GetROMManager().ScanROMs();
+				else
+					InitMT32Synth();
+
+				LCDLog(TLCDLogType::Spinner, "SoundFont rescan");
+				if (m_pSoundFontSynth)
+					m_pSoundFontSynth->GetSoundFontManager().ScanSoundFonts();
+				else
+					InitSoundFontSynth();
+
+				if (m_pSoundFontSynth)
+					LCDLog(TLCDLogType::Notice, "%d SoundFonts avail", m_pSoundFontSynth->GetSoundFontManager().GetSoundFontCount());
+			}
+		}
+
 		// Allow other tasks to run
 		pScheduler->Yield();
 	}
@@ -770,6 +823,16 @@ bool CMT32Pi::ParseCustomSysEx(const u8* pData, size_t nSize)
 	}
 }
 
+bool CMT32Pi::MountUSBFileSystem()
+{
+	// A single mount attempt. The mass-storage device may be enumerated
+	// before its media is ready (particularly on the slower DWC OTG USB
+	// controller of the Pi 3B+/Zero 2 W); in that case this returns false and
+	// the throttled retry in MainTask() keeps trying once per second until the
+	// media is ready, without blocking the audio/MIDI path.
+	return f_mount(&m_USBFileSystem, "USB:", 1) == FR_OK;
+}
+
 void CMT32Pi::UpdateUSB(bool bStartup)
 {
 	if (!m_bUSBAvailable || !m_pUSBHCI->UpdatePlugAndPlay())
@@ -784,9 +847,8 @@ void CMT32Pi::UpdateUSB(bool bStartup)
 		// USB disk was attached
 		LOGNOTE("USB mass storage device attached");
 
-		if (f_mount(&m_USBFileSystem, "USB:", 1) != FR_OK)
-			LOGERR("Failed to mount USB mass storage device");
-		else
+		m_bUSBMounted = MountUSBFileSystem();
+		if (m_bUSBMounted)
 		{
 			if (!bStartup)
 			{
@@ -806,6 +868,8 @@ void CMT32Pi::UpdateUSB(bool bStartup)
 					LCDLog(TLCDLogType::Notice, "%d SoundFonts avail", m_pSoundFontSynth->GetSoundFontManager().GetSoundFontCount());
 			}
 		}
+		else
+			LOGERR("Failed to mount USB mass storage device");
 	}
 	else if (m_pUSBMassStorageDevice && !pUSBMassStorageDevice)
 	{
@@ -813,6 +877,7 @@ void CMT32Pi::UpdateUSB(bool bStartup)
 		LOGNOTE("USB mass storage device removed");
 
 		f_unmount("USB:");
+		m_bUSBMounted = false;
 
 		// Only need to rescan SoundFonts on storage removal; MT-32 ROMs are kept in memory
 		if (m_pSoundFontSynth)
